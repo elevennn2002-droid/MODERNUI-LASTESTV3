@@ -12,6 +12,29 @@ interface BiometricScannerProps {
   onCancel: () => void;
 }
 
+export function normalizeContrast(g: Float32Array): Float32Array {
+  const size = g.length;
+  let minG = 255;
+  let maxG = 0;
+  for (let i = 0; i < size; i++) {
+    const val = g[i];
+    if (val < minG) minG = val;
+    if (val > maxG) maxG = val;
+  }
+  const range = maxG - minG;
+  const normalized = new Float32Array(size);
+  if (range <= 2) {
+    for (let i = 0; i < size; i++) {
+      normalized[i] = g[i];
+    }
+  } else {
+    for (let i = 0; i < size; i++) {
+      normalized[i] = ((g[i] - minG) / range) * 255;
+    }
+  }
+  return normalized;
+}
+
 // Grayscale Pearson Correlation Face Matcher helper for offline/unlimited local check
 export function compareFacesClientSide(base64Image1: string, base64Image2: string): Promise<number> {
   return new Promise((resolve) => {
@@ -134,12 +157,17 @@ export function compareFacesClientSide(base64Image1: string, base64Image2: strin
           return gridScore;
         };
 
-        const scoreOriginalPearson = getSimilarity(gray1, gray2Original);
-        const scoreMirroredPearson = getSimilarity(gray1, gray2Mirrored);
+        // Perform min-max contrast-stretching normalization to make matching invariant to overall exposure/darkness
+        const norm1 = normalizeContrast(gray1);
+        const norm2Original = normalizeContrast(gray2Original);
+        const norm2Mirrored = normalizeContrast(gray2Mirrored);
+
+        const scoreOriginalPearson = getSimilarity(norm1, norm2Original);
+        const scoreMirroredPearson = getSimilarity(norm1, norm2Mirrored);
         const pearsonMax = Math.max(scoreOriginalPearson, scoreMirroredPearson);
 
-        const scoreOriginalGrid = getGridSimilarity(gray1, gray2Original);
-        const scoreMirroredGrid = getGridSimilarity(gray1, gray2Mirrored);
+        const scoreOriginalGrid = getGridSimilarity(norm1, norm2Original);
+        const scoreMirroredGrid = getGridSimilarity(norm1, norm2Mirrored);
         const gridMax = Math.max(scoreOriginalGrid, scoreMirroredGrid);
 
         // Blend: 80% weight on translation-resistant grid, 20% on strict correlation
@@ -192,6 +220,61 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
   const videoRef = useRef<HTMLVideoElement>(null);
   const [cameraActive, setCameraActive] = useState<boolean>(false);
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
+
+  // Ambient Light Sensing & Night Light controls for low-light face recognition
+  const [isLowLight, setIsLowLight] = useState<boolean>(false);
+  const [nightLightActive, setNightLightActive] = useState<boolean>(false);
+  const [autoBrightness, setAutoBrightness] = useState<boolean>(true);
+  const [measuredLuminance, setMeasuredLuminance] = useState<number | null>(null);
+
+  // Real-time camera frames brightness / lux estimation analyzer
+  useEffect(() => {
+    if (scanType !== 'face' || !cameraActive || !videoRef.current) {
+      setIsLowLight(false);
+      setNightLightActive(false);
+      setMeasuredLuminance(null);
+      return;
+    }
+
+    let intervalId: any;
+    const analyzeBrightness = () => {
+      const video = videoRef.current;
+      if (!video || video.paused || video.ended) return;
+
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = 40;
+        canvas.height = 30;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const data = imgData.data;
+
+        let totalLuminance = 0;
+        for (let i = 0; i < data.length; i += 4) {
+          totalLuminance += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        }
+        const avgLuminance = totalLuminance / (data.length / 4);
+        setMeasuredLuminance(Math.round(avgLuminance));
+
+        // Let's declare low-light threshold (< 70 out of 255)
+        const low = avgLuminance < 70;
+        setIsLowLight(low);
+
+        if (low && autoBrightness) {
+          setNightLightActive(true);
+        }
+      } catch (err) {
+        // Ignored gracefully
+      }
+    };
+
+    // Run analyzer every 800ms
+    intervalId = setInterval(analyzeBrightness, 800);
+    return () => clearInterval(intervalId);
+  }, [scanType, cameraActive, autoBrightness]);
 
   // Auto Scroll Logger Ref
   const logsContainerRef = useRef<HTMLDivElement>(null);
@@ -364,6 +447,11 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
               canvas.height = video.videoHeight || 480;
               const ctx = canvas.getContext("2d");
               if (ctx) {
+                // If low-light condition is active, apply a hardware-level exposure and contrast boost to the canvas
+                if (isLowLight) {
+                  ctx.filter = "brightness(1.4) contrast(1.25) saturate(1.1)";
+                  console.log("[FACIAL SCAN] Low-light booster active: boosted snapshot exposure & contrast.");
+                }
                 ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
                 capturedFaceImage = canvas.toDataURL("image/jpeg", 0.85);
                 console.log("[FACIAL SCAN] Live frame snapshot captured successfully.");
@@ -688,8 +776,14 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
   };
 
   return (
-    <div className="fixed inset-0 z-[110] bg-black/95 backdrop-blur-md flex flex-col items-center justify-center p-4">
-      <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(56,139,253,0.12)_0%,transparent_75%)] pointer-events-none" />
+    <div className={cn(
+      "fixed inset-0 z-[110] transition-colors duration-500 flex flex-col items-center justify-center p-4",
+      nightLightActive ? "bg-[#ffffff] shadow-[inset_0_0_150px_rgba(255,255,255,0.95)]" : "bg-black/95 backdrop-blur-md"
+    )}>
+      {/* Decorative gradient overlay - hidden during active softbox flash to keep screen raw pure white */}
+      {!nightLightActive && (
+        <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(56,139,253,0.12)_0%,transparent_75%)] pointer-events-none" />
+      )}
       
       {/* Cyberpunk terminal frame */}
       <div className="w-full max-w-md bg-[#0a0d14] border border-[#30363d] rounded-2xl p-6 flex flex-col items-center relative overflow-hidden shadow-2xl">
@@ -715,7 +809,12 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
         </div>
 
         {/* Dynamic Display Panel for Fingerprint vs Face stream */}
-        <div className="relative w-48 h-48 border border-[#30363d] bg-[#0d1117] rounded-full flex flex-col items-center justify-center mb-5 overflow-hidden shadow-inner group z-10">
+        <div className={cn(
+          "relative w-48 h-48 border rounded-full flex flex-col items-center justify-center mb-5 overflow-hidden shadow-inner group z-10 transition-all duration-500",
+          (scanType === 'face' && nightLightActive) 
+            ? "border-white bg-[#0f121d] shadow-[0_0_35px_rgba(255,255,255,0.75)]" 
+            : "border-[#30363d] bg-[#0d1117]"
+        )}>
           
           {scanType === 'face' ? (
             <>
@@ -726,10 +825,14 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
                 playsInline
                 muted
                 className={cn(
-                  "w-full h-full object-cover rounded-full border-2 border-[#388bfd]/30 shadow-lg",
+                  "w-full h-full object-cover rounded-full border-2 shadow-lg transition-colors duration-500",
+                  (scanType === 'face' && nightLightActive) ? "border-white" : "border-[#388bfd]/30",
                   facingMode === 'user' ? "scale-x-[-1]" : "",
                   cameraActive ? "block" : "hidden"
                 )}
+                style={{
+                  filter: isLowLight ? "brightness(1.4) contrast(1.2)" : "none"
+                }}
               />
               
               {/* Cam toggle switch button */}
@@ -816,6 +919,82 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
             <div className="absolute inset-1.5 rounded-full border border-dashed border-[#388bfd]/30 animate-spin" style={{ animationDuration: '6s' }} />
           )}
         </div>
+
+        {/* Face scanner ambient light and softbox controllers */}
+        {scanType === 'face' && (
+          <div className="w-full z-10 bg-[#111622] rounded-xl border border-[#30363d]/50 p-3 mb-4 space-y-2.5">
+            <div className="flex items-center justify-between text-xs font-mono">
+              <span className="text-[#8b949e] flex items-center gap-1">
+                <Cpu className="w-3.5 h-3.5 text-[#388bfd]" />
+                Sensor Ambient:
+              </span>
+              <span className={cn(
+                "font-bold uppercase tracking-wider px-1.5 py-0.5 rounded text-[10px]",
+                isLowLight 
+                  ? "bg-amber-500/10 text-amber-400 border border-amber-500/30 animate-pulse" 
+                  : "bg-emerald-500/10 text-emerald-400 border border-emerald-500/30"
+              )}>
+                {measuredLuminance !== null ? `${measuredLuminance} LUX` : 'ANALYZING...'} 
+                {isLowLight ? ' [LOW LIGHT]' : ' [OPTIMAL]'}
+              </span>
+            </div>
+
+            {/* Micro-bar representing the current brightness level */}
+            {measuredLuminance !== null && (
+              <div className="w-full bg-[#161b22] h-1 rounded-full overflow-hidden">
+                <div 
+                  className={cn(
+                    "h-full transition-all duration-300",
+                    isLowLight ? "bg-amber-500" : "bg-emerald-500"
+                  )}
+                  style={{ width: `${Math.min(100, (measuredLuminance / 255) * 100)}%` }}
+                />
+              </div>
+            )}
+
+            <div className="grid grid-cols-2 gap-2 mt-1">
+              <button
+                type="button"
+                onClick={() => setNightLightActive(prev => !prev)}
+                className={cn(
+                  "py-1.5 px-2.5 rounded-lg text-[9px] font-mono tracking-widest uppercase transition-all duration-300 border flex items-center justify-center gap-1 select-none cursor-pointer",
+                  nightLightActive 
+                    ? "bg-white text-black border-white shadow-[0_0_12px_rgba(255,255,255,0.4)] font-extrabold" 
+                    : "bg-[#161b22] text-[#8b949e] border-[#30363d] hover:text-[#e6edf3]"
+                )}
+              >
+                <div className={cn("w-1.5 h-1.5 rounded-full", nightLightActive ? "bg-black animate-ping" : "bg-[#8b949e]")} />
+                Softbox Flash: {nightLightActive ? 'ON' : 'OFF'}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setAutoBrightness(prev => !prev);
+                  if (!autoBrightness && isLowLight) {
+                    setNightLightActive(true);
+                  } else if (autoBrightness) {
+                    setNightLightActive(false);
+                  }
+                }}
+                className={cn(
+                  "py-1.5 px-2.5 rounded-lg text-[9px] font-mono tracking-widest uppercase transition-all border flex items-center justify-center gap-1 select-none cursor-pointer",
+                  autoBrightness 
+                    ? "bg-[#388bfd]/10 text-[#388bfd] border-[#388bfd]/30" 
+                    : "bg-[#161b22] text-[#8b949e] border-[#30363d] hover:text-[#e6edf3]"
+                )}
+              >
+                <span>Auto Bright: {autoBrightness ? 'ON' : 'OFF'}</span>
+              </button>
+            </div>
+            
+            {isLowLight && (
+              <p className="text-[8px] text-amber-400 font-mono text-center leading-none">
+                ⚠️ Dusk/Night environment compensated. Screen illuminated to high brightness.
+              </p>
+            )}
+          </div>
+        )}
 
         {/* Selector Tabs to alternate scan method */}
         <div className="flex gap-2 mb-4.5 z-10 w-full justify-center">
