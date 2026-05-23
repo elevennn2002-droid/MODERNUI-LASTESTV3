@@ -12,6 +12,7 @@ export interface User {
 
 export interface Settings {
   apiKey: string;
+  apiKeys: { id: number; key: string }[];
   selectedModel: string;
 }
 
@@ -30,6 +31,7 @@ export const useAppStore = create<AppState>()(
       user: null,
       settings: {
         apiKey: '',
+        apiKeys: [],
         selectedModel: 'deepseek/deepseek-chat',
       },
       login: (user) => set({ user }),

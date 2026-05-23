@@ -28,6 +28,9 @@ export const api = {
   incrementMessageCount: (userId: number, token: string) => 
     fetchPhpApi({ action: 'increment_message_count', user_id: userId, token }),
 
+  reportApiKeyUsage: (userId: number, token: string, keyId: number, success: boolean) =>
+    fetchPhpApi({ action: 'report_api_key_usage', user_id: userId, token, key_id: keyId, success }),
+
   saveSessions: (userId: number, token: string, data: any[]) => 
     fetchPhpApi({ action: 'save_sessions', user_id: userId, token, device_id: DEVICE_ID, data }),
 

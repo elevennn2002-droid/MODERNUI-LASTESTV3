@@ -441,7 +441,10 @@ export default function App() {
               setShowBanModal(false);
             }
             if (res.api_key) {
-              store.setSettings({ apiKey: res.api_key });
+              store.setSettings({ 
+                apiKey: res.api_key,
+                apiKeys: Array.isArray(res.api_keys) ? res.api_keys : []
+              });
              }
              if (Array.isArray(res.available_models) && res.available_models.length > 0) {
                if (!res.available_models.includes(store.settings.selectedModel)) {
@@ -686,14 +689,49 @@ export default function App() {
       return;
     }
 
-    if (banInfo) {
-      toast.error('Account Banned');
-      return;
-    }
+    if (store.user && store.user.id && !store.user.id.startsWith('offline_')) {
+      try {
+        const res = await api.getUserStatus(Number(store.user.id), store.user.token);
+        if (res.success) {
+          setUserStatus({ ...res, banned: res.banned });
+          if (res.banned === true) {
+            setBanInfo({ reason: res.ban_reason, until: res.banned_until });
+            setShowBanModal(true);
+            toast.error('Account Banned');
+            return;
+          } else {
+            setBanInfo(null);
+            setShowBanModal(false);
+          }
+          if (res.api_key) {
+            store.setSettings({ 
+              apiKey: res.api_key,
+              apiKeys: Array.isArray(res.api_keys) ? res.api_keys : []
+            });
+          }
+          if (Array.isArray(res.available_models) && res.available_models.length > 0) {
+            if (!res.available_models.includes(store.settings.selectedModel)) {
+              store.setSettings({ selectedModel: res.available_models[0] });
+            }
+          }
+          if (Number(res.message_limit) > 0 && Number(res.messages_sent) >= Number(res.message_limit)) {
+            toast.error('Daily limit reached! Tap to subscribe');
+            return;
+          }
+        }
+      } catch (e) {
+        console.warn("Failed to update status right before sending, utilizing cached status:", e);
+      }
+    } else {
+      if (banInfo) {
+        toast.error('Account Banned');
+        return;
+      }
 
-    if (userStatus && Number(userStatus.message_limit) > 0 && Number(userStatus.messages_sent) >= Number(userStatus.message_limit)) {
-      toast.error('Daily limit reached! Tap to subscribe');
-      return;
+      if (userStatus && Number(userStatus.message_limit) > 0 && Number(userStatus.messages_sent) >= Number(userStatus.message_limit)) {
+        toast.error('Daily limit reached! Tap to subscribe');
+        return;
+      }
     }
 
     const cState = useChatStore.getState();
@@ -741,7 +779,7 @@ export default function App() {
         const currentApiKey = store.settings.apiKey;
         const titleRefText = text.trim() || (currentFile ? `Attached file ${currentFile.name}` : "File Payload");
         
-        generateSessionTitle(titleRefText, currentModel, currentApiKey)
+        generateSessionTitle(titleRefText, currentModel, currentApiKey, store.settings.apiKeys)
           .then((aiTitle) => {
             if (aiTitle && aiTitle.length > 0) {
               const refreshedState = useChatStore.getState();
@@ -860,7 +898,8 @@ export default function App() {
              setPartialText(generatedRaw);
            }
         },
-        abortControllerRef.current.signal
+        abortControllerRef.current.signal,
+        store.settings.apiKeys
       );
 
       // Flush buffer if still in first chunk (e.g. very short response)

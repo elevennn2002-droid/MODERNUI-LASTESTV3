@@ -14,22 +14,48 @@ interface BiometricScannerProps {
 
 export function normalizeContrast(g: Float32Array): Float32Array {
   const size = g.length;
+  
+  // Calculate raw mean luminance of the matrix
+  let sum = 0;
+  for (let i = 0; i < size; i++) {
+    sum += g[i];
+  }
+  const mean = sum / size;
+
+  // Adaptive gamma correction depending on raw lighting levels
+  // If extremely dark, apply a bold gamma boost (exponent < 1)
+  // to pull latent structures, shapes, and textures from the shadows.
+  let gamma = 1.0;
+  if (mean < 35) {
+    gamma = 0.40; // High compensation boost for pitch-black/very-poor lighting
+  } else if (mean < 60) {
+    gamma = 0.55; // Substantial low-light compensation curve
+  } else if (mean < 95) {
+    gamma = 0.75; // Minor boost for evening shadows
+  } else if (mean > 175) {
+    gamma = 1.35; // Contrast limiter for overexposed scenes
+  }
+
+  const gammaCorrected = new Float32Array(size);
   let minG = 255;
   let maxG = 0;
+
   for (let i = 0; i < size; i++) {
-    const val = g[i];
+    const val = 255 * Math.pow(g[i] / 255, gamma);
+    gammaCorrected[i] = val;
     if (val < minG) minG = val;
     if (val > maxG) maxG = val;
   }
+
   const range = maxG - minG;
   const normalized = new Float32Array(size);
-  if (range <= 2) {
+  if (range <= 1) {
     for (let i = 0; i < size; i++) {
-      normalized[i] = g[i];
+      normalized[i] = gammaCorrected[i];
     }
   } else {
     for (let i = 0; i < size; i++) {
-      normalized[i] = ((g[i] - minG) / range) * 255;
+      normalized[i] = ((gammaCorrected[i] - minG) / range) * 255;
     }
   }
   return normalized;
@@ -227,7 +253,20 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
   const [autoBrightness, setAutoBrightness] = useState<boolean>(true);
   const [measuredLuminance, setMeasuredLuminance] = useState<number | null>(null);
 
-  // Real-time camera frames brightness / lux estimation analyzer
+  // Dynamic Head Face Box Tracker state
+  const [faceBox, setFaceBox] = useState<{ x: number; y: number; width: number; height: number; detected: boolean }>({
+    x: 50,
+    y: 45,
+    width: 60,
+    height: 60,
+    detected: false
+  });
+  const emaX = useRef<number>(50);
+  const emaY = useRef<number>(45);
+  const emaW = useRef<number>(60);
+  const emaH = useRef<number>(60);
+
+  // Real-time camera frames brightness / lux estimation analyzer & skin facial tracking
   useEffect(() => {
     if (scanType !== 'face' || !cameraActive || !videoRef.current) {
       setIsLowLight(false);
@@ -237,7 +276,7 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
     }
 
     let intervalId: any;
-    const analyzeBrightness = () => {
+    const analyzeBrightnessAndTrack = () => {
       const video = videoRef.current;
       if (!video || video.paused || video.ended) return;
 
@@ -253,28 +292,94 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
         const data = imgData.data;
 
         let totalLuminance = 0;
-        for (let i = 0; i < data.length; i += 4) {
-          totalLuminance += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        let sumX = 0;
+        let sumY = 0;
+        let facePixelCount = 0;
+        let minX = 40;
+        let maxX = 0;
+        let minY = 30;
+        let maxY = 0;
+
+        for (let y = 0; y < 30; y++) {
+          for (let x = 0; x < 40; x++) {
+            const i = (y * 40 + x) * 4;
+            const r = data[i];
+            const g = data[i + 1];
+            const b = data[i + 2];
+
+            // 1. Calculate standard luminance contribution
+            totalLuminance += 0.299 * r + 0.587 * g + 0.114 * b;
+
+            // 2. Skin tone detection criteria (works across varied phototypes/lighting)
+            const matchesSkin = r > 55 && r > g && r - g > 10 && g > 30 && b > 20 && Math.abs(g - b) < 45;
+            if (matchesSkin) {
+              sumX += x;
+              sumY += y;
+              facePixelCount++;
+              if (x < minX) minX = x;
+              if (x > maxX) maxX = x;
+              if (y < minY) minY = y;
+              if (y > maxY) maxY = y;
+            }
+          }
         }
+
         const avgLuminance = totalLuminance / (data.length / 4);
         setMeasuredLuminance(Math.round(avgLuminance));
 
-        // Let's declare low-light threshold (< 70 out of 255)
+        // Threshold of low-light environment (< 70)
         const low = avgLuminance < 70;
         setIsLowLight(low);
 
         if (low && autoBrightness) {
           setNightLightActive(true);
         }
+
+        // 3. Process Face Bounding Box movement
+        let targetX = 50;
+        let targetY = 45;
+        let targetW = 60;
+        let targetH = 60;
+        let faceFound = false;
+
+        if (facePixelCount > 8) {
+          const rawX = (sumX / facePixelCount) / 40 * 100;
+          const rawY = (sumY / facePixelCount) / 30 * 100;
+
+          // Inverse horizontal orientation if user mirror projection is active
+          targetX = facingMode === 'user' ? (100 - rawX) : rawX;
+          targetY = rawY;
+
+          // Deduce bounding box ratios
+          const boxW = Math.max(35, ((maxX - minX) / 40) * 115);
+          const boxH = Math.max(35, ((maxY - minY) / 30) * 115);
+          targetW = Math.min(85, boxW);
+          targetH = Math.min(85, boxH);
+          faceFound = true;
+        }
+
+        // Exponential move filtering (glides elegantly)
+        emaX.current = emaX.current * 0.72 + targetX * 0.28;
+        emaY.current = emaY.current * 0.72 + targetY * 0.28;
+        emaW.current = emaW.current * 0.78 + targetW * 0.22;
+        emaH.current = emaH.current * 0.78 + targetH * 0.22;
+
+        setFaceBox({
+          x: Math.round(emaX.current),
+          y: Math.round(emaY.current),
+          width: Math.round(emaW.current),
+          height: Math.round(emaH.current),
+          detected: faceFound
+        });
       } catch (err) {
         // Ignored gracefully
       }
     };
 
-    // Run analyzer every 800ms
-    intervalId = setInterval(analyzeBrightness, 800);
+    // Run analyzer & tracking loop frequently (every 140ms is highly responsive with EMA)
+    intervalId = setInterval(analyzeBrightnessAndTrack, 140);
     return () => clearInterval(intervalId);
-  }, [scanType, cameraActive, autoBrightness]);
+  }, [scanType, cameraActive, autoBrightness, facingMode]);
 
   // Auto Scroll Logger Ref
   const logsContainerRef = useRef<HTMLDivElement>(null);
@@ -785,8 +890,13 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(56,139,253,0.12)_0%,transparent_75%)] pointer-events-none" />
       )}
       
-      {/* Cyberpunk terminal frame */}
-      <div className="w-full max-w-md bg-[#0a0d14] border border-[#30363d] rounded-2xl p-6 flex flex-col items-center relative overflow-hidden shadow-2xl">
+      {/* Cyberpunk terminal frame with high-illuminance white styling in softbox light mode */}
+      <div className={cn(
+        "w-full max-w-md border rounded-2xl p-6 flex flex-col items-center relative overflow-hidden shadow-2xl transition-all duration-700",
+        nightLightActive 
+          ? "bg-slate-50 border-white text-zinc-900 shadow-[0_20px_50px_rgba(0,0,0,0.15)]" 
+          : "bg-[#0a0d14] border-[#30363d] text-white"
+      )}>
         <div className="absolute top-0 inset-x-0 h-1 bg-gradient-to-r from-[#388bfd] via-[#58a6ff] to-[#388bfd]" />
 
         {/* Section Header */}
@@ -794,13 +904,19 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
           <div className="p-2.5 bg-[#388bfd]/10 border border-[#388bfd]/25 rounded-xl text-[#388bfd] mb-2.5 animate-pulse">
             <Smile className="w-5 h-5" />
           </div>
-          <h3 className="text-base font-extrabold uppercase tracking-widest text-white font-mono">
+          <h3 className={cn(
+            "text-base font-extrabold uppercase tracking-widest font-mono transition-colors duration-500",
+            nightLightActive ? "text-zinc-900" : "text-white"
+          )}>
             {scanType === 'face' 
               ? (mode === 'register' ? 'Register Face ID' : 'Face Biometric Match')
               : (mode === 'register' ? 'Register Touch ID' : 'Touch ID Match')
             }
           </h3>
-          <p className="text-xs text-[#8b949e] font-sans mt-0.5 max-w-xs">
+          <p className={cn(
+            "text-xs font-sans mt-0.5 max-w-xs transition-colors duration-500",
+            nightLightActive ? "text-zinc-600" : "text-[#8b949e]"
+          )}>
             {scanType === 'face'
               ? 'Real-time eye-iris mapping, dermal spatial coordinate triangulation, and bio liveliness node inspection.'
               : 'Instruct the system to link this browser session with your secure device touch biometrics.'
@@ -812,13 +928,13 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
         <div className={cn(
           "relative w-48 h-48 border rounded-full flex flex-col items-center justify-center mb-5 overflow-hidden shadow-inner group z-10 transition-all duration-500",
           (scanType === 'face' && nightLightActive) 
-            ? "border-white bg-[#0f121d] shadow-[0_0_35px_rgba(255,255,255,0.75)]" 
+            ? "border-blue-500 bg-white shadow-[0_0_40px_rgba(31,111,235,0.4)]" 
             : "border-[#30363d] bg-[#0d1117]"
         )}>
           
           {scanType === 'face' ? (
             <>
-              {/* CAMERA VIDEO STREAM OR VECTOR MESH SIMULATION */}
+              {/* CAMERA VIDEO STREAM */}
               <video
                 ref={videoRef}
                 autoPlay
@@ -826,12 +942,12 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
                 muted
                 className={cn(
                   "w-full h-full object-cover rounded-full border-2 shadow-lg transition-colors duration-500",
-                  (scanType === 'face' && nightLightActive) ? "border-white" : "border-[#388bfd]/30",
+                  (scanType === 'face' && nightLightActive) ? "border-blue-500" : "border-[#388bfd]/30",
                   facingMode === 'user' ? "scale-x-[-1]" : "",
                   cameraActive ? "block" : "hidden"
                 )}
                 style={{
-                  filter: isLowLight ? "brightness(1.4) contrast(1.2)" : "none"
+                  filter: isLowLight ? "brightness(1.50) contrast(1.30) saturate(1.10)" : "none"
                 }}
               />
               
@@ -862,25 +978,39 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
                 </div>
               )}
 
-              {/* HUD Target Overlay Brackets */}
-              <div className="absolute inset-0 border-[3px] border-transparent rounded-full flex items-center justify-center pointer-events-none">
-                {/* Visual Camera target markings */}
-                <div className="absolute top-6 left-6 w-4 h-4 border-t-2 border-l-2 border-[#58a6ff]" />
-                <div className="absolute top-6 right-6 w-4 h-4 border-t-2 border-r-2 border-[#58a6ff]" />
-                <div className="absolute bottom-6 left-6 w-4 h-4 border-b-2 border-l-2 border-[#58a6ff]" />
-                <div className="absolute bottom-6 right-6 w-4 h-4 border-b-2 border-r-2 border-[#58a6ff]" />
-                
-                {/* Horizontal scanner bar */}
-                <div 
-                  className={cn(
-                    "absolute left-0 right-0 h-0.5 bg-gradient-to-r from-transparent via-[#388bfd] to-transparent shadow-[0_0_8px_#388bfd] pointer-events-none",
-                    isPressing ? "animate-bounce" : "hidden"
-                  )} 
-                />
+              {/* HUDS Spatial Camera Target Tracking Grid - PHYSICALLY MOVES with user's face motion! */}
+              <div 
+                className="absolute border border-dashed rounded-lg pointer-events-none transition-all duration-[80ms] flex flex-col items-center justify-between"
+                style={{
+                  left: `${faceBox.x - faceBox.width / 2}%`,
+                  top: `${faceBox.y - faceBox.height / 2}%`,
+                  width: `${faceBox.width}%`,
+                  height: `${faceBox.height}%`,
+                  borderColor: nightLightActive ? 'rgb(31, 111, 235)' : '#388bfd',
+                  boxShadow: faceBox.detected 
+                    ? (nightLightActive ? '0 0 15px rgba(31,111,235,0.4)' : '0 0 15px rgba(56,139,253,0.3)')
+                    : 'none'
+                }}
+              >
+                {/* Visual Corner Clips of the floating tracking envelope */}
+                <div className="absolute top-0 left-0 w-2.5 h-2.5 border-t-2 border-l-2 border-inherit" />
+                <div className="absolute top-0 right-0 w-2.5 h-2.5 border-t-2 border-r-2 border-inherit" />
+                <div className="absolute bottom-0 left-0 w-2.5 h-2.5 border-b-2 border-l-2 border-inherit" />
+                <div className="absolute bottom-0 right-0 w-2.5 h-2.5 border-b-2 border-r-2 border-inherit" />
 
-                {/* Eye scanner target overlay blocks */}
-                <div className="absolute top-1/3 left-1/4 w-4 h-4 border border-dashed border-[#58a6ff]/40 rounded-full animate-ping" />
-                <div className="absolute top-1/3 right-1/4 w-4 h-4 border border-dashed border-[#58a6ff]/40 rounded-full animate-ping" />
+                {/* Status HUD readout centered at the top of the box */}
+                <div className={cn(
+                  "absolute -top-4 text-[7px] font-mono whitespace-nowrap tracking-widest px-1 rounded uppercase font-bold transition-colors",
+                  nightLightActive ? "bg-blue-600 text-white" : "bg-[#111622] text-[#388bfd]"
+                )}>
+                  {faceBox.detected ? `LOCKED: ${faceBox.x}%, ${faceBox.y}%` : 'TRACKING FACE...'}
+                </div>
+
+                {/* Horizontal scanner bar confined to the floating face bounding box */}
+                <div className={cn(
+                  "w-full h-0.5 shadow-[0_0_8px_currentColor] transition-all",
+                  isPressing ? "bg-red-400 text-red-500 animate-bounce" : "bg-emerald-400 text-emerald-400 animate-pulse"
+                )} />
               </div>
             </>
           ) : (
@@ -922,17 +1052,25 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
 
         {/* Face scanner ambient light and softbox controllers */}
         {scanType === 'face' && (
-          <div className="w-full z-10 bg-[#111622] rounded-xl border border-[#30363d]/50 p-3 mb-4 space-y-2.5">
+          <div className={cn(
+            "w-full z-10 p-3 mb-4 space-y-2.5 rounded-xl border transition-colors duration-500",
+            nightLightActive 
+              ? "bg-white border-zinc-200 text-zinc-800" 
+              : "bg-[#111622] border-[#30363d]/50 text-white"
+          )}>
             <div className="flex items-center justify-between text-xs font-mono">
-              <span className="text-[#8b949e] flex items-center gap-1">
+              <span className={cn(
+                "flex items-center gap-1 transition-colors duration-500",
+                nightLightActive ? "text-zinc-600" : "text-[#8b949e]"
+              )}>
                 <Cpu className="w-3.5 h-3.5 text-[#388bfd]" />
                 Sensor Ambient:
               </span>
               <span className={cn(
                 "font-bold uppercase tracking-wider px-1.5 py-0.5 rounded text-[10px]",
                 isLowLight 
-                  ? "bg-amber-500/10 text-amber-400 border border-amber-500/30 animate-pulse" 
-                  : "bg-emerald-500/10 text-emerald-400 border border-emerald-500/30"
+                  ? "bg-amber-500/10 text-amber-500 border border-amber-500/30 animate-pulse font-extrabold" 
+                  : "bg-emerald-500/10 text-emerald-500 border border-emerald-500/30"
               )}>
                 {measuredLuminance !== null ? `${measuredLuminance} LUX` : 'ANALYZING...'} 
                 {isLowLight ? ' [LOW LIGHT]' : ' [OPTIMAL]'}
@@ -941,7 +1079,7 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
 
             {/* Micro-bar representing the current brightness level */}
             {measuredLuminance !== null && (
-              <div className="w-full bg-[#161b22] h-1 rounded-full overflow-hidden">
+              <div className={cn("w-full h-1 rounded-full overflow-hidden", nightLightActive ? "bg-zinc-100" : "bg-[#161b22]")}>
                 <div 
                   className={cn(
                     "h-full transition-all duration-300",
@@ -959,11 +1097,11 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
                 className={cn(
                   "py-1.5 px-2.5 rounded-lg text-[9px] font-mono tracking-widest uppercase transition-all duration-300 border flex items-center justify-center gap-1 select-none cursor-pointer",
                   nightLightActive 
-                    ? "bg-white text-black border-white shadow-[0_0_12px_rgba(255,255,255,0.4)] font-extrabold" 
+                    ? "bg-blue-600 text-white border-blue-600 shadow-[0_0_12px_rgba(31,111,235,0.4)] font-extrabold" 
                     : "bg-[#161b22] text-[#8b949e] border-[#30363d] hover:text-[#e6edf3]"
                 )}
               >
-                <div className={cn("w-1.5 h-1.5 rounded-full", nightLightActive ? "bg-black animate-ping" : "bg-[#8b949e]")} />
+                <div className={cn("w-1.5 h-1.5 rounded-full", nightLightActive ? "bg-white animate-ping" : "bg-[#8b949e]")} />
                 Softbox Flash: {nightLightActive ? 'ON' : 'OFF'}
               </button>
 
@@ -980,8 +1118,8 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
                 className={cn(
                   "py-1.5 px-2.5 rounded-lg text-[9px] font-mono tracking-widest uppercase transition-all border flex items-center justify-center gap-1 select-none cursor-pointer",
                   autoBrightness 
-                    ? "bg-[#388bfd]/10 text-[#388bfd] border-[#388bfd]/30" 
-                    : "bg-[#161b22] text-[#8b949e] border-[#30363d] hover:text-[#e6edf3]"
+                    ? "bg-blue-500/10 text-blue-600 border-blue-500/30 font-bold" 
+                    : (nightLightActive ? "bg-zinc-100 text-zinc-500 border-zinc-200 hover:text-zinc-800" : "bg-[#161b22] text-[#8b949e] border-[#30363d] hover:text-[#e6edf3]")
                 )}
               >
                 <span>Auto Bright: {autoBrightness ? 'ON' : 'OFF'}</span>
@@ -989,8 +1127,8 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
             </div>
             
             {isLowLight && (
-              <p className="text-[8px] text-amber-400 font-mono text-center leading-none">
-                ⚠️ Dusk/Night environment compensated. Screen illuminated to high brightness.
+              <p className="text-[8px] text-amber-500 font-bold font-mono text-center leading-none animate-pulse">
+                ⚠️ Low-light compensated. Dynamic gain & Screen softbox active.
               </p>
             )}
           </div>
@@ -1004,8 +1142,10 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
             className={cn(
               "flex-1 py-2 rounded-xl text-[9px] font-bold uppercase tracking-wider font-mono border transition-all cursor-pointer flex items-center justify-center gap-1.5",
               scanType === 'finger' 
-                ? "bg-[#388bfd]/10 border-[#388bfd]/40 text-[#388bfd]" 
-                : "bg-transparent border-[#30363d] text-[#8b949e] hover:text-[#e6edf3]"
+                ? "bg-[#1f6feb]/10 border-[#1f6feb]/40 text-[#1f6feb] font-extrabold" 
+                : (nightLightActive 
+                  ? "bg-transparent border-zinc-200 text-zinc-500 hover:text-zinc-800 hover:bg-zinc-100" 
+                  : "bg-transparent border-[#30363d] text-[#8b949e] hover:text-[#e6edf3]")
             )}
           >
             <Fingerprint className="w-3.5 h-3.5" />
@@ -1018,8 +1158,10 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
             className={cn(
               "flex-1 py-2 rounded-xl text-[9px] font-bold uppercase tracking-wider font-mono border transition-all cursor-pointer flex items-center justify-center gap-1.5",
               scanType === 'face' 
-                ? "bg-[#388bfd]/10 border-[#388bfd]/40 text-[#388bfd]" 
-                : "bg-transparent border-[#30363d] text-[#8b949e] hover:text-[#e6edf3]"
+                ? "bg-[#1f6feb]/10 border-[#1f6feb]/40 text-[#1f6feb] font-extrabold" 
+                : (nightLightActive 
+                  ? "bg-transparent border-zinc-200 text-zinc-500 hover:text-zinc-800 hover:bg-zinc-100" 
+                  : "bg-transparent border-[#30363d] text-[#8b949e] hover:text-[#e6edf3]")
             )}
           >
             <Camera className="w-3.5 h-3.5" />
@@ -1039,12 +1181,17 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
 
         {/* Iframe containment warning & test triggers */}
         {isIframe && (
-          <div className="w-full z-10 bg-[#388bfd]/5 border border-[#1f6feb]/25 rounded-xl p-3.5 mb-4 text-left">
+          <div className={cn(
+            "w-full z-10 border rounded-xl p-3.5 mb-4 text-left transition-colors duration-500",
+            nightLightActive 
+              ? "bg-zinc-100/50 border-zinc-200" 
+              : "bg-[#388bfd]/5 border border-[#1f6feb]/25"
+          )}>
             <div className="flex items-start gap-2.5">
-              <AlertTriangle className="w-4 h-4 text-[#58a6ff] shrink-0 mt-0.5" />
+              <AlertTriangle className={cn("w-4 h-4 shrink-0 mt-0.5", nightLightActive ? "text-blue-600" : "text-[#58a6ff]")} />
               <div className="space-y-1">
-                <p className="text-[10px] font-bold text-[#58a6ff] uppercase tracking-wider font-mono leading-none">Security Sandbox Active</p>
-                <p className="text-[9px] text-[#8b949e] leading-snug">
+                <p className={cn("text-[10px] font-bold uppercase tracking-wider font-mono leading-none", nightLightActive ? "text-blue-700" : "text-[#58a6ff]")}>Security Sandbox Active</p>
+                <p className={cn("text-[9px] leading-snug", nightLightActive ? "text-zinc-600" : "text-[#8b949e]")}>
                   Native OS TouchID / FaceID authenticators may require parent context authorization. Use local dynamic capture simulation to run authentication inside this frame immediately!
                 </p>
               </div>
@@ -1054,7 +1201,12 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
               <button
                 type="button"
                 onClick={handleOpenInNewTab}
-                className="flex items-center justify-center gap-1.5 text-[8.5px] font-black uppercase bg-[#21262d] hover:bg-[#30363d] text-white border border-[#30363d] py-2 px-1 rounded-lg font-mono transition-transform active:scale-[0.98] cursor-pointer"
+                className={cn(
+                  "flex items-center justify-center gap-1.5 text-[8.5px] font-black uppercase border py-2 px-1 rounded-lg font-mono transition-transform active:scale-[0.98] cursor-pointer",
+                  nightLightActive 
+                    ? "bg-white hover:bg-zinc-50 border-zinc-200 text-zinc-800" 
+                    : "bg-[#21262d] hover:bg-[#30363d] text-white border-[#30363d]"
+                )}
               >
                 <ExternalLink className="w-3 h-3 text-[#388bfd]" />
                 Open in New Tab
@@ -1073,30 +1225,43 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
         )}
 
         {/* Dynamic scanning telemetry logging display */}
-        <div className="w-full bg-[#111622]/80 border border-[#30363d]/40 rounded-xl p-4 font-mono text-[9px] space-y-1.5 z-10">
-          <div className="flex justify-between items-center text-[#8b949e] font-bold">
-            <span>{scanType === 'face' ? 'FACIAL TRACKER CONDUIT:' : 'HARVEST PROGRESS STATE:'}</span>
+        <div className={cn(
+          "w-full border p-4 font-mono text-[9px] space-y-1.5 z-10 transition-colors duration-500 rounded-xl",
+          nightLightActive 
+            ? "bg-white border-zinc-200 text-zinc-800 shadow-sm" 
+            : "bg-[#111622]/80 border-[#30363d]/40 text-[#8b949e]"
+        )}>
+          <div className="flex justify-between items-center font-bold">
+            <span className={nightLightActive ? "text-zinc-600 font-semibold" : "text-[#8b949e]"}>
+              {scanType === 'face' ? 'FACIAL TRACKER CONDUIT:' : 'HARVEST PROGRESS STATE:'}
+            </span>
             <span className={cn(
               "font-extrabold font-mono",
-              progress === 100 ? "text-[#58a6ff]" : "text-[#388bfd]"
+              progress === 100 ? (nightLightActive ? "text-blue-600" : "text-[#58a6ff]") : "text-[#388bfd]"
             )}>
               {progress.toFixed(0)}%
             </span>
           </div>
           
-          <div className="w-full bg-[#161b22] h-1 rounded-full overflow-hidden">
+          <div className={cn("w-full h-1 rounded-full overflow-hidden", nightLightActive ? "bg-zinc-100" : "bg-[#161b22]")}>
             <div 
               className="h-full bg-gradient-to-r from-[#388bfd] to-[#58a6ff] transition-all duration-100"
               style={{ width: `${progress}%` }}
             />
           </div>
 
-          <div ref={logsContainerRef} className="border-t border-[#30363d]/30 pt-1.5 max-h-20 overflow-y-auto space-y-1 scrollbar-thin scrollbar-thumb-zinc-900 leading-snug text-[#8b949e]">
+          <div 
+            ref={logsContainerRef} 
+            className={cn(
+              "border-t pt-1.5 max-h-20 overflow-y-auto space-y-1 scrollbar-thin scrollbar-thumb-zinc-900 leading-snug text-[8px] tracking-wide font-mono",
+              nightLightActive ? "border-zinc-200 text-zinc-600" : "border-[#30363d]/30 text-[#8b949e]"
+            )}
+          >
             {logs.map((log, index) => (
               <div key={index} className="opacity-95 text-[8px] tracking-wide font-mono">{log}</div>
             ))}
             {isPressing && (
-              <div className="text-[#bfdbfe] animate-pulse">
+              <div className={cn("animate-pulse", nightLightActive ? "text-blue-600 font-bold" : "text-[#bfdbfe]")}>
                 {scanType === 'face' 
                   ? "⚡ RUNNING IRIS MATCHING & LANDMARK TELEMETRY..."
                   : "⚡ HARVESTING SURFACE DERMAL GEOMETRY CAPTURES..."
@@ -1111,7 +1276,12 @@ export default function BiometricScanner({ mode, username, userData, defaultScan
           <button
             type="button"
             onClick={onCancel}
-            className="flex-1 bg-transparent border border-[#30363d] text-[#8b949e] hover:text-white rounded-xl py-2 font-mono text-[10px] uppercase font-bold tracking-widest transition-all cursor-pointer"
+            className={cn(
+              "flex-1 border font-mono text-[10px] uppercase font-bold tracking-widest transition-all cursor-pointer rounded-xl py-2",
+              nightLightActive 
+                ? "bg-zinc-100 border-zinc-200 text-[#ea4335] hover:bg-zinc-200" 
+                : "bg-transparent border-[#30363d] text-[#8b949e] hover:text-white"
+            )}
           >
             Abort Core
           </button>
